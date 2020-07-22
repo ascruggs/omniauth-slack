@@ -56,7 +56,8 @@ module OmniAuth
       # OAuth2::Client options.
       option :client_options, {
         site: 'https://slack.com',
-        token_url: '/api/oauth.access',
+        authorize_url: '/oauth/v2/authorize',
+        token_url: '/api/oauth.v2.access',
         auth_scheme: :basic_auth
       }
       
@@ -205,8 +206,8 @@ module OmniAuth
         
         new_client
       end
-      
-      # Drops query_string from callback_url to prevent some errors in call to /api/oauth.access.
+
+      # Dropping query_string from callback_url prevents some errors in call to /api/oauth.v2.access.
       def callback_url
         full_host + script_name + callback_path
       end
@@ -239,14 +240,9 @@ module OmniAuth
         end
       end
 
-      def user_id
-        # access_token['user_id'] || access_token['user'].to_h['id'] || access_token['authorizing_user'].to_h['user_id']
-        access_token.user_id
-      end
-      
-      def team_id
-        # access_token['team_id'] || access_token['team'].to_h['id']
-        access_token.team_id
+      # Parsed data returned from /slack/oauth.v2.access api call.
+      def auth
+        @auth ||= access_token.params.to_h.merge({'token' => access_token.token})
       end
 
       def web_hook_info
