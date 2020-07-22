@@ -1,59 +1,15 @@
 require 'omniauth/strategies/oauth2'
-require 'omniauth-slack/refinements'
-require 'omniauth-slack/slack'
-require 'omniauth-slack/data_methods'
-require 'omniauth-slack/omniauth/auth_hash'
 require 'thread'
 require 'uri'
 
 module OmniAuth
-  #using Slack::OmniAuthRefinements
-  using Slack::OAuth2Refinements
-  
   module Strategies
+    
     class Slack < OmniAuth::Strategies::OAuth2
-      include OmniAuth::Slack::DataMethods
-    
-      class AuthHash < OmniAuth::Slack::AuthHash;
-      end
-    
-      debug{"#{self} setting up default options"}
-      
-      # Master list of authorization options handled by omniauth-slack.
-      AUTH_OPTIONS = %w(redirect_uri scope team team_domain )
-      
-      # Default strategy name.
       option :name, 'slack'
-      
-      # Options that can be passed with provider authorization URL.
-      option :authorize_options, AUTH_OPTIONS - %w(team_domain)
-      
-      # Options allowed to pass from omniauth /auth/<provider> URL
-      # to provider authorization URL.
-      option :pass_through_params, ['team']
-      
-      # TODO: Should this be in DataMethods module?
-      #       Maybe, since you almost always want a default of 0
-      #       and since the method is defined in DataMethods.
-      option :preload_data_with_threads, 0
-      
-      # Define additional data-methods to be called on
-      # successful authorization.
-      option :additional_data
-      
-      # Describes which data-methods are gated. Only these data-methods
-      # can be controlled by the :dependencies option.
-      # 
-      # This is generally not a setting that the user should be changing.
-      # The user should adjust the :dependencies option instead.
-      option :dependency_filter, /^api_/
-      
-      # Describes which data-methods are called and in what order.
-      # Gated data-methods that are ommitted from this list (by the user)
-      # will not be called.
-      option :dependencies
 
-      # OAuth2::Client options.
+      option :authorize_options, [:scope, :team, :team_domain, :redirect_uri]
+
       option :client_options, {
         site: 'https://slack.com',
         authorize_url: '/oauth/v2/authorize',
@@ -61,148 +17,174 @@ module OmniAuth
         auth_scheme: :basic_auth
       }
       
-      # Authorization token-exchange API call options.
       option :auth_token_params, {
         mode: :query,
         param_name: 'token'
       }
       
+      option :preload_data_with_threads, 0
+      
+      option :include_data, []
+      
+      option :exclude_data, []
+      
+      option :additional_data, {}
+      
       # User ID is not guaranteed to be globally unique across all Slack users.
       # The combination of user ID and team ID, on the other hand, is guaranteed
       # to be globally unique.
       uid { "#{user_id}-#{team_id}" }
-
-      # Gathers access_token and awarded scopes.
+      
       credentials do
         {
-          token_type: access_token['token_type'],
-          scope: access_token['scope'],
-          scopes: access_token.all_scopes
+          token: auth['token'],
+          scope: (is_app_token? ? all_scopes : auth['scope']),
+          expires: false
         }
       end
 
-      # Gathers a myriad of possible data returned from omniauth-slack /api/oauth.access call.
-      info do        
-        num_threads, method_names = options.preload_data_with_threads
-        if num_threads.to_i > 0
-          preload_data_with_threads(num_threads.to_i, method_names || dependencies + options.additional_data.to_h.keys)
+      info do
+      
+        unless skip_info?
+          define_additional_data
+          semaphore
         end
-     
+        
+        num_threads = options.preload_data_with_threads.to_i
+        
+        if num_threads > 0 && !skip_info?
+          preload_data_with_threads(num_threads)
+        end
+      
         # Start with only what we can glean from the authorization response.
-        hash = OmniAuth::Slack::Hashy.new(
-          name: user_name,
-          email: user_email,
+        hash = { 
+          name: auth['user'].to_h['name'],
+          email: auth['user'].to_h['email'],
           user_id: user_id,
+          team_name: auth['team_name'] || auth['team'].to_h['name'],
           team_id: team_id,
-          team_name: team_name,
-          team_domain: team_domain,
-          team_image: team_image,
-          team_email_domain: team_email_domain,
-          nickname: nickname,
-          image: image
-        )
+          image: auth['team'].to_h['image_48']
+        }
 
-        # Disabled to manually define info.
-        # TODO: This might be obsoldete now?
-        #apply_data_methods(hash)
-
-        # Adds data from api_users_info and/or api_users_profile, if allowed by scope and other settings.
+        # Now add everything else, using further calls to the api, if necessary.
         unless skip_info?
           %w(first_name last_name phone skype avatar_hash real_name real_name_normalized).each do |key|
             hash[key.to_sym] = (
-              api_users_info['user'].to_h['profile'] ||
-              api_users_profile['profile']
+              user_info['user'].to_h['profile'] ||
+              user_profile['profile']
             ).to_h[key]
           end
 
           %w(deleted status color tz tz_label tz_offset is_admin is_owner is_primary_owner is_restricted is_ultra_restricted is_bot has_2fa).each do |key|
-            hash[key.to_sym] = api_users_info['user'].to_h[key]
+            hash[key.to_sym] = user_info['user'].to_h[key]
           end
-        end
-        
-        hash
-      end # info
 
-      # Gathers additiona API calls, user-defined additional_data method responses, and raw Slack API responses.
+          more_info = {
+            image: (
+              hash[:image] ||
+              user_identity.to_h['image_48'] ||
+              user_info['user'].to_h['profile'].to_h['image_48'] ||
+              user_profile['profile'].to_h['image_48']
+              ),
+            name:(
+              hash[:name] ||
+              user_identity['name'] ||
+              user_info['user'].to_h['real_name'] ||
+              user_profile['profile'].to_h['real_name']
+              ),
+            email:(
+              hash[:email] ||
+              user_identity.to_h['email'] ||
+              user_info['user'].to_h['profile'].to_h['email'] ||
+              user_profile['profile'].to_h['email']
+              ),
+            team_name:(
+              hash[:team_name] ||
+              team_identity.to_h['name'] ||
+              team_info['team'].to_h['name']
+              ),
+            team_domain:(
+              auth['team'].to_h['domain'] ||
+              team_identity.to_h['domain'] ||
+              team_info['team'].to_h['domain']
+              ),
+            team_image:(
+              auth['team'].to_h['image_44'] ||
+              team_identity.to_h['image_44'] ||
+              team_info['team'].to_h['icon'].to_h['image_44']
+              ),
+            team_email_domain:(
+              team_info['team'].to_h['email_domain']
+              ),
+            nickname:(
+              user_info.to_h['user'].to_h['name'] ||
+              auth['user'].to_h['name'] ||
+              user_identity.to_h['name']
+              ),
+          }
+          
+          hash.merge!(more_info)
+        end
+        hash
+      end
+
       extra do
         {
-          # scopes_requested: (env['omniauth.params'] && env['omniauth.params']['scope']) || \
-          #   (env['omniauth.strategy'] && env['omniauth.strategy'].options && env['omniauth.strategy'].options.scope),
-          scopes_requested: scopes_requested,
+          scopes_requested: (env['omniauth.params'] && env['omniauth.params']['scope']) || \
+            (env['omniauth.strategy'] && env['omniauth.strategy'].options && env['omniauth.strategy'].options.scope),
           web_hook_info: web_hook_info,
-          bot_info: access_token['bot'] || api_bots_info['bot'],
-          access_token_hash: access_token.to_hash,
-          #identity: @identity,
-          identity: @api_users_identity,
-          user_info: @api_users_info,
-          user_profile: @api_users_profile,
-          team_info: @api_team_info,
+          bot_info: auth['bot'] || bot_info['bot'],
+          auth: auth,
+          identity: identity,
+          user_info: user_info,
+          user_profile: user_profile,
+          team_info: team_info,
+          apps_permissions_users_list: apps_permissions_users_list,
           additional_data: get_additional_data,
-          raw_info: raw_info
+          raw_info: @raw_info
         }
       end
+
       
-      # Adds user-defined additional_data methods to this
-      # class and to OmniAuth::Slack::AccessToken class.
-      def self.define_additional_data(definitions={})
-        return if @additional_data_defined
-        if !definitions.to_h.empty?
-          definitions.each do |k,v|
-            data_method(k, v)
-            OmniAuth::Slack::OAuth2::AccessToken.data_method(k, v)
-          end
-          @additional_data_defined = 1
-        end
-      end
-
-
-      # Overrides OmniAuth::Oauth2#authorize_params so that
-      # specified params can be passed on to Slack authorization GET request.
+      # Pass on certain authorize_params to the Slack authorization GET request.
       # See https://github.com/omniauth/omniauth/issues/390
       def authorize_params
-        super.tap do |prms|
-          params_digest = prms.hash
-          debug{"Using authorize_params #{prms}"}
-          prms.merge!(request.params.keep_if{|k,v| pass_through_params.reject{|o| o.to_s == 'team_domain'}.include?(k.to_s)})
-          log(:debug, "Modified authorize_params #{prms}") if prms.hash != params_digest
-          session['omniauth.authorize_params'] = prms
+        super.tap do |params|
+          %w(scope team redirect_uri).each do |v|
+            if !request.params[v].to_s.empty?
+              params[v.to_sym] = request.params[v]
+            end
+          end
+          log(:debug, "Authorize_params #{params.to_h}")
         end
       end
       
-      # Overrides OmniAuth callback phase to extract session var
-      # for omniauth.authorize_params into env (this is how omniauth does this).
-      def callback_phase #(*args)
-        # This technique copied from OmniAuth::Strategy (this is how they do it for the other omniauth objects).
-        env['omniauth.authorize_params'] = session.delete('omniauth.authorize_params')
-                
-        # This is trying to help move additiona_data definition away from user-action.
-        self.class.define_additional_data(options.additional_data)
-        
-        result = super
-      end
-      
-      # Overrides OmniAuth::Strategies::OAuth2#client to define custom behavior.
+      # Get a new OAuth2::Client and define custom behavior.
+      # * overrides previous omniauth-strategies-oauth2 :client definition.
       #
-      # * Logs API requests with OmniAuth.logger.
-      # * Adds API responses to @raw_info hash.
-      # * Sets auth site uri with custom subdomain (if provided).
-      #
-      # Returns instance of custom OmniAuth::Slack::OAuth2::Client.
+      # * Log API requests with OmniAuth.logger
+      # * Add API responses to @raw_info hash
+      # * Set auth site uri with custom subdomain (if provided).
       #
       def client
-        #new_client = super
+        new_client = super
         
-        # Simple override to use our custom subclassed OAuth2::Client instead.
-        # The Client.new call is lifted directly from OmniAuth::Strategies::OAuth2.
-        new_client = OmniAuth::Slack::OAuth2::Client.new(options.client_id, options.client_secret, deep_symbolize(options.client_options))
-               
-        # Set client#subdomain with custom team_domain, if exists and allowed.
-        new_client.subdomain = (pass_through_params.include?('team_domain') && request.params['team_domain']) ? request.params['team_domain'] : options.team_domain
+        team_domain = request.params['team_domain'] || options[:team_domain]
+        if !team_domain.to_s.empty?
+          site_uri = URI.parse(options[:client_options]['site'])
+          site_uri.host = "#{team_domain}.slack.com"
+          new_client.site = site_uri.to_s
+          log(:debug, "Oauth site uri with custom team_domain #{site_uri}")
+        end
         
-        # Put the raw_info in a place where the Client will update it for each API request.
-        new_client.history = raw_info
-        
-        debug{"Strategy #{self} using Client #{new_client}"}
+        st_raw_info = raw_info
+        new_client.define_singleton_method(:request) do |*args|
+          OmniAuth.logger.send(:debug, "(slack) API request #{args[0..1]}; in thread #{Thread.current.object_id}.")
+          request_output = super(*args)
+          uri = args[1].to_s.gsub(/^.*\/([^\/]+)/, '\1') # use single-quote or double-back-slash for replacement.
+          st_raw_info[uri.to_s]= request_output
+          request_output
+        end
         
         new_client
       end
@@ -212,28 +194,90 @@ module OmniAuth
         full_host + script_name + callback_path
       end
 
+      def identity
+        return {} unless !skip_info? && has_scope?(identity: ['identity.basic','identity:read:user']) && is_not_excluded?
+        semaphore.synchronize {
+          @identity_raw ||= access_token.get('/api/users.identity', headers: {'X-Slack-User' => user_id})
+          @identity ||= @identity_raw.parsed
+        }
+      end
+      
       
       private
       
-      # Gets and decodes :pass_through_params option.
-      def pass_through_params
-        ptp = [options.pass_through_params].flatten.compact
-        case
-          when ptp[0].to_s == 'all'
-            options.pass_through_params = AUTH_OPTIONS
-          when ptp[0].to_s == 'none'
-            []
-          else
-            ptp
+      def initialize(*args)
+        super
+        @main_semaphore = Mutex.new
+        @semaphores = {}
+      end
+      
+      # Get a mutex specific to the calling method.
+      # This operation is synchronized with its own mutex.
+      def semaphore(method_name = caller[0][/`([^']*)'/, 1])
+        @main_semaphore.synchronize {
+          @semaphores[method_name] ||= Mutex.new
+        }
+      end
+      
+      def active_methods
+        @active_methods ||= (
+          includes = [options.include_data].flatten.compact
+          excludes = [options.exclude_data].flatten.compact unless includes.size > 0
+          method_list = %w(apps_permissions_users_list identity user_info user_profile team_info bot_info)  #.concat(options[:additional_data].keys)
+          if includes.size > 0
+            method_list.keep_if {|m| includes.include?(m.to_s) || includes.include?(m.to_s.to_sym)}
+          elsif excludes.size > 0
+            method_list.delete_if {|m| excludes.include?(m.to_s) || excludes.include?(m.to_s.to_sym)}
+          end
+          log :debug, "Activated API calls: #{method_list}."
+          log :debug, "Activated additional_data calls: #{options.additional_data.keys}."
+          method_list
+        )
+      end
+      
+      def is_not_excluded?(method_name = caller[0][/`([^']*)'/, 1])
+        active_methods.include?(method_name.to_s) || active_methods.include?(method_name.to_s.to_sym)
+      end
+      
+      # Preload additional api calls with a pool of threads.
+      def preload_data_with_threads(num_threads)
+        return unless num_threads > 0
+        preload_methods = active_methods.concat(options[:additional_data].keys)
+        log :info, "Preloading (#{preload_methods.size}) data requests using (#{num_threads}) threads."
+        work_q = Queue.new
+        preload_methods.each{|x| work_q.push x }
+        workers = num_threads.to_i.times.map do
+          Thread.new do
+            begin
+              while x = work_q.pop(true)
+                log :debug, "Preloading #{x}."
+                send x
+              end
+            rescue ThreadError
+            end
+          end
+        end
+        workers.map(&:join); "ok"
+      end
+      
+      # Define methods for addional data from :additional_data option
+      def define_additional_data
+        hash = options[:additional_data]
+        if !hash.to_h.empty?
+          hash.each do |k,v|
+            define_singleton_method(k) do
+              instance_variable_get(:"@#{k}") || 
+              instance_variable_set(:"@#{k}", v.respond_to?(:call) ? v.call(env) : v)
+            end
+          end
         end
       end
       
-      # Runs/calls/compiles results from additional_data definitions.
       def get_additional_data
-        if false && skip_info?
+        if skip_info?
           {}
         else
-          options.additional_data.to_h.inject({}) do |hash,tupple|
+          options[:additional_data].inject({}) do |hash,tupple|
             hash[tupple[0].to_s] = send(tupple[0].to_s)
             hash
           end
@@ -245,146 +289,123 @@ module OmniAuth
         @auth ||= access_token.params.to_h.merge({'token' => access_token.token})
       end
 
+      def user_identity
+        @user_identity ||= identity['user'].to_h
+      end
+
+      def team_identity
+        @team_identity ||= identity['team'].to_h
+      end
+
+      def user_info
+        return {} unless !skip_info? && has_scope?(identity: 'users:read', team: 'users:read') && is_not_excluded?
+        semaphore.synchronize {
+          @user_info_raw ||= access_token.get('/api/users.info', params: {user: user_id}, headers: {'X-Slack-User' => user_id})
+          @user_info ||= @user_info_raw.parsed
+        }
+      end
+      
+      def user_profile
+        return {} unless !skip_info? && has_scope?(identity: 'users.profile:read', team: 'users.profile:read') && is_not_excluded?
+        semaphore.synchronize {
+          @user_profile_raw ||= access_token.get('/api/users.profile.get', params: {user: user_id}, headers: {'X-Slack-User' => user_id})
+          @user_profile ||= @user_profile_raw.parsed
+        }
+      end
+
+      def team_info
+        return {} unless !skip_info? && has_scope?(identity: 'team:read', team: 'team:read') && is_not_excluded?
+        semaphore.synchronize {
+          @team_info_raw ||= access_token.get('/api/team.info')
+          @team_info ||= @team_info_raw.parsed
+        }
+      end
+
       def web_hook_info
-        #return {} unless access_token.key? 'incoming_webhook'
-        access_token['incoming_webhook']
-      end
-
-
-      # The data_method class method takes a name, hash, and/or block.
-      # The block is evaluated in the context of the new DataMethod instance.
-      # Use the DSL methods within the block to construct the DataMethod instance.
-      # See data_methods.rb for available DSL methods.
-                    
-      data_method :user_name, info_key: 'name', storage: :user_name, source: [
-        {name: 'access_token', code: 'user_name'},
-        {name: 'api_users_identity', code: "self['user'].to_h.fetch('name',nil)"},
-        {name: 'api_users_info', code: "fetch('user',{}).to_h['real_name']"},
-        {name: 'api_users_profile', code: "fetch('profile',{}).to_h['real_name']"}
-      ]
-      
-      data_method :user_email, info_key: 'email', storage: :user_email, source: [
-        {name: 'access_token', code: "user_email"},
-        {name: 'api_users_identity', code: "self['user'].to_h.fetch('email',nil)"},
-        {name: 'api_users_info', code: "fetch('user',{}).to_h['profile'].to_h['email']"},
-        {name: 'api_users_profile', code: "fetch('profile',{}).to_h['email']"}
-      ]
-      
-      data_method :image do
-        source(:access_token) { self['user'].to_h.find{|k,v| k.to_s[/image_/]}.to_a[1] }
-        source(:api_users_identity){ self['user'].to_h.find{|k,v| k.to_s[/image_/]}.to_a[1] }
-        source(:api_users_info) { self['user'].to_h['profile'].to_h.find{|k,v| k.to_s[/image_/]}.to_a[1] }
-        source(:api_users_profile) { self['profile'].to_h.find{|k,v| k.to_s[/image_/]}.to_a[1] }
+        return {} unless auth.key? 'incoming_webhook'
+        auth['incoming_webhook']
       end
       
-      data_method :team_name do
-        source(:access_token) { team_name }
-        source(:api_users_identity){ self['team'].to_h['name'] }
-        source(:api_team_info) { self['team'].to_h['name'] }
+      def bot_info
+        return {} unless !skip_info? && has_scope?(identity: 'users:read') && is_not_excluded?
+        semaphore.synchronize {
+          @bot_info_raw ||= access_token.get('/api/bots.info')
+          @bot_info ||= @bot_info_raw.parsed
+        }
       end
       
-      data_method :team_domain do
-        source(:access_token) { self['team'].to_h['domain'] }
-        source(:api_users_identity) { self['team'].to_h['domain'] }
-        source(:api_team_info) { self['team'].to_h['domain'] }
+      def user_id
+        auth['user_id'] || auth['user'].to_h['id'] || auth['authorizing_user'].to_h['user_id']
       end
       
-      data_method :team_image do
-        source(:access_token) { self['team'].to_h.find{|k,v| k.to_s[/image_/]}.to_a[1] }
-        source(:api_users_identity) { self['team'].to_h.find{|k,v| k.to_s[/image_/]}.to_a[1] }
-        source(:api_team_info) { self['team'].to_h['icon'].to_h.find{|k,v| k.to_s[/image_/]}.to_a[1] }
-      end
-      
-      # Team_info is apparently the only source for this data,
-      # so it will be called every cycle, regardless of whether the data is there or not.
-      # TODO: Consider disabling this, or add has_scope? capabillties to source objects.
-      data_method :team_email_domain do
-        condition { false }
-        source(:api_team_info) { self['team'].to_h['email_domain'] }
-      end
-                  
-      data_method :nickname do
-        source(:api_users_info) { deep_find 'display_name' }
-        source(:api_users_info) { deep_find 'name' }
-        source(:api_users_profile) { deep_find 'display_name' }
-      end
-
-      data_method :api_users_identity,
-        scope: {classic:'identity.basic', identity:'identity:read:user'},
-        storage: :api_users_identity,
-        condition: proc{ true },
-        default_value: {},
-        source: [
-          {name: 'access_token', code: proc{ get('/api/users.identity', headers: {'X-Slack-User' => user_id}).parsed }}
-        ]
-
-      data_method :api_users_info do
-        default_value AuthHash.new
-        scope classic: 'users:read', team: 'users:read'
-        source :access_token do
-          get('/api/users.info', params: {user: user_id}, headers: {'X-Slack-User' => user_id}).to_auth_hash
-        end
-      end
-
-      data_method :api_users_profile do
-        default_value AuthHash.new
-        scope classic: 'users.profile:read', team: 'users.profile:read'
-        source :access_token do
-          get('/api/users.profile.get', params: {user: user_id}, headers: {'X-Slack-User' => user_id}).to_auth_hash
-        end
-      end      
-
-      data_method :api_team_info do
-        scope classic: 'team:read', team:'team:read'
-        default_value Hash.new
-        source :access_token do
-          get('/api/team.info').parsed
-        end
-      end
-      
-      data_method :api_bots_info do
-        scope classic: 'users:read', team: 'users:read'
-        condition { !is_app_token? }
-        default_value Hash.new
-        source :access_token do
-          get('/api/bots.info').parsed
-        end
+      def team_id
+        auth['team_id'] || auth['team'].to_h['id']
       end
       
       # API call to get user permissions for workspace token.
-      # This used to be needed, but its functionality is now in AcessToken.
+      # This is needed because workspace token 'sign-in-with-slack' is missing scopes
+      # in the :scope field (acknowledged issue in developer preview).
       #
       # Returns [<id>: <resource>]
-      #      
-      # data_method :api_apps_permissions_users_list do
-      #   default_value {}
-      #   condition proc { is_app_token? }
-      #   source :access_token, 'apps_permissions_users_list(user_id)'
-      # end 
-
-      # This hash is handed to the access-token, which in turn fills it with API response objects.
+      def apps_permissions_users_list
+        return {} unless !skip_info? && is_app_token? && is_not_excluded?
+        semaphore.synchronize {
+          @apps_permissions_users_list_raw ||= access_token.get('/api/apps.permissions.users.list')
+          @apps_permissions_users_list ||= @apps_permissions_users_list_raw.parsed['resources'].inject({}){|h,i| h[i['id']] = i; h}
+        }
+      end
+      
       def raw_info
         @raw_info ||= {}
       end
-
+      
       # Is this a workspace app token?
       def is_app_token?
-        access_token.is_app_token?
+        auth['token_type'].to_s == 'app'
       end
       
-      def scopes_requested
-        # omniauth.authorize_params is a custom enhancement to omniauth for omniauth-slack.
-        env['omniauth.authorize_params'].to_h['scope']
-      end
-
-      def has_scope?(*args)
-        access_token.has_scope?(*args)
+      # Scopes come from at least 3 different places now.
+      # * The classic :scope field (string)
+      # * New workshop token :scopes field (hash)
+      # * Separate call to apps.permissions.users.list (array)
+      #
+      # This returns hash of workspace scopes, with classic & new identity scopes in :identity.
+      # Lists of scopes are in array form.
+      def all_scopes
+        @all_scopes ||=
+        {'identity' => (auth['scope'] || apps_permissions_users_list[user_id].to_h['scopes'].to_a.join(',')).to_s.split(',')}
+        .merge(auth['scopes'].to_h)
       end
       
-      # Copies the api_* data-methods to AccessToken.
-      data_methods.each{|k,v| OmniAuth::Slack::OAuth2::AccessToken.data_method(k, v) if k.to_s[default_options.dependency_filter]}
+      # Determine if given scopes exist in current authorization.
+      # Scopes is hash where
+      #   key == scope type <identity|app_hope|team|channel|group|mpim|im>
+      #   val == array or string of individual scopes.
+      def has_scope?(**scopes_hash)
+        scopes_hash.detect do |section, scopes|
+          test_scopes = case
+            when scopes.is_a?(String); scopes.split(',')
+            when scopes.is_a?(Array); scopes
+            else raise "Scope must be a string or array"
+          end
+          test_scopes.detect do |scope|
+            all_scopes[section.to_s].to_a.include?(scope.to_s)
+          end
+        end
+      end
       
-    end # Slack
-  end # Strategies
-end # OmniAuth
-
+      def self.ad_hoc_client(client_id, client_key, token)
+        puts default_options['client_options'].to_yaml
+        ::OAuth2::AccessToken.new(
+          ::OAuth2::Client.new(
+            client_id,
+            client_key,
+            default_options['client_options'].map{|k,v| [k.to_sym, v]}.to_h
+          ),
+          token
+        )
+      end
+      
+    end
+  end
+end
